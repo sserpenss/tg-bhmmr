@@ -73,18 +73,22 @@ func NewSpamFilter(ctx context.Context, detector Detector, params SpamConfig) *S
 }
 
 // OnMessage checks if user already approved and if not checks if user is a spammer
-func (s *SpamFilter) OnMessage(msg Message) (response Response) {
+func (s *SpamFilter) OnMessage(msg Message, checkOnly bool) (response Response) {
 	if msg.From.ID == 0 { // don't check system messages
 		return Response{}
 	}
 	displayUsername := DisplayName(msg)
 
-	spamReq := spamcheck.Request{Msg: msg.Text, UserID: strconv.FormatInt(msg.From.ID, 10), UserName: msg.From.Username}
+	spamReq := spamcheck.Request{Msg: msg.Text, CheckOnly: checkOnly,
+		UserID: strconv.FormatInt(msg.From.ID, 10), UserName: msg.From.Username}
 	if msg.Image != nil {
 		spamReq.Meta.Images = 1
 	}
 	if msg.WithVideo || msg.WithVideoNote {
 		spamReq.Meta.HasVideo = true
+	}
+	if msg.WithForward {
+		spamReq.Meta.HasForward = true
 	}
 	spamReq.Meta.Links = strings.Count(msg.Text, "http://") + strings.Count(msg.Text, "https://")
 	isSpam, checkResults := s.Check(spamReq)

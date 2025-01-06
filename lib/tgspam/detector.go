@@ -56,6 +56,13 @@ type Config struct {
 	MinSpamProbability  float64    // minimum spam probability to consider a message spam with classifier, if 0 - ignored
 	OpenAIVeto          bool       // if true, openai will be used to veto spam messages, otherwise it will be used to veto ham messages
 	MultiLangWords      int        // if true, check for number of multi-lingual words
+
+	AbnormalSpacing struct {
+		Enabled                 bool    // if true, enable check for abnormal spacing
+		ShortWordLen            int     // the length of the word to be considered short (in rune characters)
+		ShortWordRatioThreshold float64 // the ratio of short words to all words in the message
+		SpaceRatioThreshold     float64 // the ratio of spaces to all characters in the message
+	}
 }
 
 // SampleUpdater is an interface for updating spam/ham samples on the fly.
@@ -116,6 +123,7 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 		return false
 	}
 
+	cleanMsg := d.cleanText(req.Msg)
 	d.lock.RLock()
 	defer d.lock.RUnlock()
 
@@ -128,7 +136,7 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 
 	// check for stop words if any stop words are loaded
 	if len(d.stopWords) > 0 {
-		cr = append(cr, d.isStopWord(req.Msg))
+		cr = append(cr, d.isStopWord(cleanMsg))
 	}
 
 	// check for emojis if max allowed emojis is set
@@ -150,6 +158,10 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 		cr = append(cr, d.isMultiLang(req.Msg))
 	}
 
+	if d.AbnormalSpacing.Enabled {
+		cr = append(cr, d.isAbnormalSpacing(req.Msg))
+	}
+
 	// check for message length exceed the minimum size, if min message length is set.
 	// the check is done after first simple checks, because stop words and emojis can be triggered by short messages as well.
 	if len([]rune(req.Msg)) < d.MinMsgLen {
@@ -162,12 +174,12 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 
 	// check for spam similarity if a similarity threshold is set and spam samples are loaded
 	if d.SimilarityThreshold > 0 && len(d.tokenizedSpam) > 0 {
-		cr = append(cr, d.isSpamSimilarityHigh(req.Msg))
+		cr = append(cr, d.isSpamSimilarityHigh(cleanMsg))
 	}
 
 	// check for spam with classifier if classifier is loaded
 	if d.classifier.nAllDocument > 0 && d.classifier.nDocumentByClass["ham"] > 0 && d.classifier.nDocumentByClass["spam"] > 0 {
-		cr = append(cr, d.isSpamClassified(req.Msg))
+		cr = append(cr, d.isSpamClassified(cleanMsg))
 	}
 
 	spamDetected := isSpamDetected(cr)
@@ -178,14 +190,19 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 	// FirstMessageOnly or FirstMessagesCount has to be set to use openai, because it's slow and expensive to run on all messages
 	if d.openaiChecker != nil && (d.FirstMessageOnly || d.FirstMessagesCount > 0) {
 		if !spamDetected && !d.OpenAIVeto || spamDetected && d.OpenAIVeto {
-			spam, details := d.openaiChecker.check(req.Msg)
+			spam, details := d.openaiChecker.check(cleanMsg)
 			cr = append(cr, details)
 			if spamDetected && details.Error != nil {
 				// spam detected with other checks, but openai failed. in this case, we still return spam, but log the error
 				log.Printf("[WARN] openai error: %v", details.Error)
 			} else {
-				log.Printf("[DEBUG] openai result: %v", details)
+				log.Printf("[DEBUG] openai result: {%s}", details.String())
 				spamDetected = spam
+			}
+
+			// log if veto is enabled, and openai detected no spam for message that was detected as spam by other checks
+			if d.OpenAIVeto && !spam {
+				log.Printf("[DEBUG] openai vetoed ham message: %q, checks: %s", req.Msg, spamcheck.ChecksToString(cr))
 			}
 		}
 	}
@@ -198,8 +215,8 @@ func (d *Detector) Check(req spamcheck.Request) (spam bool, cr []spamcheck.Respo
 		au := approved.UserInfo{Count: d.approvedUsers[req.UserID].Count + 1, UserID: req.UserID,
 			UserName: req.UserName, Timestamp: time.Now()}
 		d.approvedUsers[req.UserID] = au
-		if d.userStorage != nil {
-			_ = d.userStorage.Write(au) // ignore error, failed to write to storage is not critical
+		if d.userStorage != nil && !req.CheckOnly {
+			_ = d.userStorage.Write(au) // ignore error, failed to write to storage is not critical here
 		}
 	}
 	return false, cr
@@ -645,4 +662,86 @@ func (d *Detector) isMultiLang(msg string) spamcheck.Response {
 		return spamcheck.Response{Name: "multi-lingual", Spam: true, Details: fmt.Sprintf("%d/%d", count, d.MultiLangWords)}
 	}
 	return spamcheck.Response{Name: "multi-lingual", Spam: false, Details: fmt.Sprintf("%d/%d", count, d.MultiLangWords)}
+}
+
+// isAbnormalSpacing detects abnormal spacing patterns used to evade filters
+// things like this: "w o r d s p a c i n g some thing he re blah blah"
+func (d *Detector) isAbnormalSpacing(msg string) spamcheck.Response {
+	text := strings.ToUpper(msg)
+
+	// quick check for empty or very short text
+	if len(text) < 10 {
+		return spamcheck.Response{
+			Name:    "word-spacing",
+			Spam:    false,
+			Details: "too short",
+		}
+	}
+
+	words := strings.Fields(text)
+
+	// count letters and spaces in original text
+	var totalChars, spaces int
+	for _, r := range text {
+		if unicode.IsLetter(r) {
+			totalChars++
+		} else if unicode.IsSpace(r) {
+			spaces++
+		}
+	}
+
+	// look for suspicious word lengths and spacing patterns
+	shortWords := 0
+	if d.AbnormalSpacing.ShortWordLen > 0 { // if ShortWordLen is 0, skip short word detection
+		for _, word := range words {
+			wordRunes := []rune(word)
+			if len(wordRunes) <= d.AbnormalSpacing.ShortWordLen && len(wordRunes) > 0 {
+				shortWords++
+			}
+		}
+	}
+
+	// safety check
+	if spaces == 0 || totalChars == 0 {
+		return spamcheck.Response{
+			Name:    "word-spacing",
+			Spam:    false,
+			Details: "no spaces or letters",
+		}
+	}
+
+	// calculate ratios
+	spaceRatio := float64(spaces) / float64(totalChars)
+	shortWordRatio := float64(shortWords) / float64(len(words))
+	if shortWordRatio > d.AbnormalSpacing.ShortWordRatioThreshold || spaceRatio > d.AbnormalSpacing.SpaceRatioThreshold {
+		return spamcheck.Response{
+			Name:    "word-spacing",
+			Spam:    true,
+			Details: fmt.Sprintf("abnormal spacing (ratio: %.2f, short words: %.0f%%)", spaceRatio, shortWordRatio*100),
+		}
+	}
+
+	return spamcheck.Response{
+		Name:    "word-spacing",
+		Spam:    false,
+		Details: fmt.Sprintf("normal spacing (ratio: %.2f, short words: %.0f%%)", spaceRatio, shortWordRatio*100),
+	}
+}
+
+// cleanText removes control and format characters from a given text
+func (d *Detector) cleanText(text string) string {
+	var result strings.Builder
+	result.Grow(len(text))
+	for _, r := range text {
+		// skip control and format characters
+		if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		// skip specific ranges of invisible characters
+		if (r >= 0x200B && r <= 0x200F) || (r >= 0x2060 && r <= 0x206F) {
+			continue
+		}
+		result.WriteRune(r)
+	}
+	return result.String()
 }

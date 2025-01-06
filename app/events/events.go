@@ -51,7 +51,7 @@ type Locator interface {
 
 // Bot is an interface for bot events.
 type Bot interface {
-	OnMessage(msg bot.Message) (response bot.Response)
+	OnMessage(msg bot.Message, checkOnly bool) (response bot.Response)
 	UpdateSpam(msg string) error
 	UpdateHam(msg string) error
 	AddApprovedUser(id int64, name string) error
@@ -279,6 +279,10 @@ func transform(msg *tbapi.Message) *bot.Message {
 		message.WithVideo = true
 	case msg.VideoNote != nil:
 		message.WithVideoNote = true
+	case msg.Story != nil: // telegram story is a sort of video-like thing, mark it as video
+		message.WithVideo = true
+	case msg.ForwardOrigin != nil:
+		message.WithForward = true
 	}
 
 	// fill in the message's reply-to message

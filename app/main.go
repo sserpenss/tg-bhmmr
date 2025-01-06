@@ -21,9 +21,10 @@ import (
 	tbapi "github.com/OvyFlash/telegram-bot-api"
 	"github.com/fatih/color"
 	"github.com/go-pkgz/lgr"
+	"github.com/go-pkgz/rest"
+	"github.com/jessevdk/go-flags"
 	"github.com/jmoiron/sqlx"
 	"github.com/sashabaranov/go-openai"
-	"github.com/umputun/go-flags"
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	"github.com/umputun/tg-spam/app/bot"
@@ -70,6 +71,7 @@ type options struct {
 		ImageOnly  bool `long:"image-only" env:"IMAGE_ONLY" description:"enable image only check"`
 		LinksOnly  bool `long:"links-only" env:"LINKS_ONLY" description:"enable links only check"`
 		VideosOnly bool `long:"video-only" env:"VIDEO_ONLY" description:"enable video only check"`
+		Forward    bool `long:"forward" env:"FORWARD" description:"enable forward check"`
 	} `group:"meta" namespace:"meta" env-namespace:"META"`
 
 	OpenAI struct {
@@ -83,6 +85,13 @@ type options struct {
 		MaxSymbolsRequest                int    `long:"max-symbols-request" env:"MAX_SYMBOLS_REQUEST" default:"16000" description:"openai max symbols in request, failback if tokenizer failed"`
 		RetryCount                       int    `long:"retry-count" env:"RETRY_COUNT" default:"1" description:"openai retry count"`
 	} `group:"openai" namespace:"openai" env-namespace:"OPENAI"`
+
+	AbnormalSpacing struct {
+		Enabled                 bool    `long:"enabled" env:"ENABLED" description:"enable abnormal words check"`
+		SpaceRatioThreshold     float64 `long:"ratio" env:"RATIO" default:"0.3" description:"the ratio of spaces to all characters in the message"`
+		ShortWordRatioThreshold float64 `long:"short-ratio" env:"SHORT_RATIO" default:"0.7" description:"the ratio of short words to all words in the message"`
+		ShortWordLen            int     `long:"short-word" env:"SHORT_WORD" default:"3" description:"the length of the word to be considered short"`
+	} `group:"space" namespace:"space" env-namespace:"SPACE"`
 
 	Files struct {
 		SamplesDataPath string        `long:"samples" env:"SAMPLES" default:"data" description:"samples data path"`
@@ -110,6 +119,7 @@ type options struct {
 		Enabled    bool   `long:"enabled" env:"ENABLED" description:"enable web server"`
 		ListenAddr string `long:"listen" env:"LISTEN" default:":8080" description:"listen address"`
 		AuthPasswd string `long:"auth" env:"AUTH" default:"auto" description:"basic auth password for user 'tg-spam'"`
+		AuthHash   string `long:"auth-hash" env:"AUTH_HASH" default:"" description:"basic auth password hash for user 'tg-spam'"`
 	} `group:"server" namespace:"server" env-namespace:"SERVER"`
 
 	Training bool `long:"training" env:"TRAINING" description:"training mode, passive spam detection only"`
@@ -146,9 +156,14 @@ func main() {
 	}
 
 	masked := []string{opts.Telegram.Token, opts.OpenAI.Token}
-	if opts.Server.AuthPasswd != "auto" && opts.Server.AuthPasswd != "" { // auto passwd should not be masked as we print it
+	if opts.Server.AuthPasswd != "auto" && opts.Server.AuthPasswd != "" {
+		// auto passwd should not be masked as we print it
 		masked = append(masked, opts.Server.AuthPasswd)
 	}
+	if opts.Server.AuthHash != "" {
+		masked = append(masked, opts.Server.AuthHash)
+	}
+
 	setupLog(opts.Dbg, masked...)
 
 	log.Printf("[DEBUG] options: %+v", opts)
@@ -341,7 +356,11 @@ func activateServer(ctx context.Context, opts options, sf *bot.SpamFilter, loc *
 		if err != nil {
 			return fmt.Errorf("can't generate random password, %w", err)
 		}
-		log.Printf("[WARN] generated basic auth password for user tg-spam: %q", authPassswd)
+		authHash, err := rest.GenerateBcryptHash(authPassswd)
+		if err != nil {
+			return fmt.Errorf("can't generate bcrypt hash for password, %w", err)
+		}
+		log.Printf("[WARN] generated basic auth password for user tg-spam: %q, bcrypt hash: %s", authPassswd, authHash)
 	}
 
 	// make store and load approved users
@@ -363,6 +382,7 @@ func activateServer(ctx context.Context, opts options, sf *bot.SpamFilter, loc *
 		MetaLinksOnly:           opts.Meta.LinksOnly,
 		MetaImageOnly:           opts.Meta.ImageOnly,
 		MetaVideoOnly:           opts.Meta.VideosOnly,
+		MetaForwarded:           opts.Meta.Forward,
 		MultiLangLimit:          opts.MultiLangWords,
 		OpenAIEnabled:           opts.OpenAI.Token != "" || opts.OpenAI.APIBase != "",
 		SamplesDataPath:         opts.Files.SamplesDataPath,
@@ -385,6 +405,7 @@ func activateServer(ctx context.Context, opts options, sf *bot.SpamFilter, loc *
 		Locator:      loc,
 		DetectedSpam: detectedSpamStore,
 		AuthPasswd:   authPassswd,
+		AuthHash:     opts.Server.AuthHash,
 		Version:      revision,
 		Dbg:          opts.Dbg,
 		Settings:     settings,
@@ -425,7 +446,6 @@ func makeDetector(opts options) *tgspam.Detector {
 	}
 
 	detector := tgspam.NewDetector(detectorConfig)
-	log.Printf("[DEBUG] detector config: %+v", detectorConfig)
 
 	if opts.OpenAI.Token != "" || opts.OpenAI.APIBase != "" {
 		log.Printf("[WARN] openai enabled")
@@ -447,6 +467,14 @@ func makeDetector(opts options) *tgspam.Detector {
 		detector.WithOpenAIChecker(openai.NewClientWithConfig(config), openAIConfig)
 	}
 
+	if opts.AbnormalSpacing.Enabled {
+		log.Printf("[INFO] words spacing check enabled")
+		detector.AbnormalSpacing.Enabled = true
+		detector.AbnormalSpacing.ShortWordLen = opts.AbnormalSpacing.ShortWordLen
+		detector.AbnormalSpacing.ShortWordRatioThreshold = opts.AbnormalSpacing.ShortWordRatioThreshold
+		detector.AbnormalSpacing.SpaceRatioThreshold = opts.AbnormalSpacing.SpaceRatioThreshold
+	}
+
 	metaChecks := []tgspam.MetaCheck{}
 	if opts.Meta.ImageOnly {
 		log.Printf("[INFO] image only check enabled")
@@ -464,6 +492,10 @@ func makeDetector(opts options) *tgspam.Detector {
 		log.Printf("[INFO] links only check enabled")
 		metaChecks = append(metaChecks, tgspam.LinkOnlyCheck())
 	}
+	if opts.Meta.Forward {
+		log.Printf("[INFO] forward check enabled")
+		metaChecks = append(metaChecks, tgspam.ForwardedCheck())
+	}
 	detector.WithMetaChecks(metaChecks...)
 
 	dynSpamFile := filepath.Join(opts.Files.DynamicDataPath, dynamicSpamFile)
@@ -474,6 +506,7 @@ func makeDetector(opts options) *tgspam.Detector {
 	detector.WithHamUpdater(bot.NewSampleUpdater(dynHamFile))
 	log.Printf("[DEBUG] dynamic ham file: %s", dynHamFile)
 
+	log.Printf("[DEBUG] detector config: %+v", detectorConfig)
 	return detector
 }
 
